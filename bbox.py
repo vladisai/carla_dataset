@@ -1,84 +1,47 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2019 Aptiv
-#
-# This work is licensed under the terms of the MIT license.
-# For a copy, see <https://opensource.org/licenses/MIT>.
-
-"""
-An example of client-side bounding boxes with basic car controls.
-
-Controls:
-
-    W            : throttle
-    S            : brake
-    AD           : steer
-    Space        : hand-brake
-
-    ESC          : quit
-"""
-
-# ==============================================================================
-# -- find carla module ---------------------------------------------------------
-# ==============================================================================
-
-
-import glob
-import os
-import sys
-from carla import ColorConverter as cc
 import logging
+import os
 import threading
 import pickle
 import string
 import random
+import time
 from datetime import datetime
 from pathlib import Path
+from enum import Enum
+import argparse
+import traceback
+import weakref
+from dataclasses import dataclass, fields
+import json
 
-mutex = threading.Lock()
+from typing import NamedTuple
+from typing import List, Tuple, Optional, Any
 
+import numpy as np
 
-def breakpoint():
-    import pdb
+import imageio
 
-    pdb.set_trace()
+import pygame
+from pygame.locals import K_ESCAPE
+from pygame.locals import K_SPACE
+from pygame.locals import K_a
+from pygame.locals import K_d
+from pygame.locals import K_s
+from pygame.locals import K_w
 
-
-try:
-    sys.path.append(
-        glob.glob(
-            "../carla/dist/carla-*%d.%d-%s.egg"
-            % (sys.version_info.major, sys.version_info.minor, "win-amd64" if os.name == "nt" else "linux-x86_64")
-        )[0]
-    )
-except IndexError:
-    pass
-
-
-# ==============================================================================
-# -- imports -------------------------------------------------------------------
-# ==============================================================================
+if 'CARLAPATH' in os.environ:
+    import sys
+    sys.path.append(os.path.join(os.environ['CARLAPATH'], 'dist/carla-0.9.11-py3.7-linux-x86_64.egg'))
+    sys.path.append(os.environ['CARLAPATH'])
 
 import carla
+from carla import ColorConverter as cc
 
-import weakref
-import random
+import carla_vehicle_annotator
 
-try:
-    import pygame
-    from pygame.locals import K_ESCAPE
-    from pygame.locals import K_SPACE
-    from pygame.locals import K_a
-    from pygame.locals import K_d
-    from pygame.locals import K_s
-    from pygame.locals import K_w
-except ImportError:
-    raise RuntimeError("cannot import pygame, make sure pygame package is installed")
-
-try:
-    import numpy as np
-except ImportError:
-    raise RuntimeError("cannot import numpy, make sure numpy package is installed")
+mutex = threading.Lock()
 
 VIEW_WIDTH = 1920 // 2
 VIEW_HEIGHT = 1080 // 2
@@ -90,12 +53,10 @@ CAMERA_ATTRIBUTES = {
     "fov": str(VIEW_FOV),
 }
 
-BB_COLOR = (248, 64, 24)
-BB_COLOR_Q = (64, 248, 24)
-
 CAMERA_BP_STR = "sensor.camera.rgb"
 SEMANTIC_BP_STR = "sensor.camera.semantic_segmentation"
 DEPTH_BP_STR = "sensor.camera.depth"
+LIDAR_BP_STR = "sensor.lidar.ray_cast_semantic"
 
 COLOR_CONVERTERS = {
     CAMERA_BP_STR: cc.Raw,
@@ -103,58 +64,90 @@ COLOR_CONVERTERS = {
     DEPTH_BP_STR: cc.Depth,
 }
 
-# ==============================================================================
-# -- ClientSideBoundingBoxes ---------------------------------------------------
-# ==============================================================================
+PROCESS_EVERY_N_FRAMES = 10
 
 
-def spawn_vehicles(client, world, number_of_vehicles):
-    blueprints = world.get_blueprint_library().filter("vehicle.*")
+class SensorLocation(Enum):
+    FC = 1
+    FL = 2
+    FR = 3
 
-    spawn_points = world.get_map().get_spawn_points()
-    number_of_spawn_points = len(spawn_points)
 
-    if number_of_vehicles < number_of_spawn_points:
-        random.shuffle(spawn_points)
-    elif number_of_vehicles > number_of_spawn_points:
-        msg = "requested %d vehicles, but could only find %d spawn points"
-        logging.warning(msg, number_of_vehicles, number_of_spawn_points)
-        number_of_vehicles = number_of_spawn_points
+SENSOR_POSITIONS = {SensorLocation.FC: 0, SensorLocation.FL: -0.483, SensorLocation.FR: 0.483}
 
-    # @todo cannot import these directly.
-    SpawnActor = carla.command.SpawnActor
-    SetAutopilot = carla.command.SetAutopilot
-    FutureActor = carla.command.FutureActor
 
-    # --------------
-    # Spawn vehicles
-    # --------------
-    batch = []
-    actor_list = []
-    for n, transform in enumerate(spawn_points):
-        if n >= number_of_vehicles:
-            break
-        blueprint = random.choice(blueprints)
-        if blueprint.has_attribute("color"):
-            color = random.choice(blueprint.get_attribute("color").recommended_values)
-            blueprint.set_attribute("color", color)
-        blueprint.set_attribute("role_name", "autopilot")
-        batch.append(SpawnActor(blueprint, transform).then(SetAutopilot(FutureActor, True)))
+class Box(NamedTuple):
+    points: List[List[Tuple[float, float]]]
+    distance_to_camera: float
+    max_distance_to_center: float
+    vehicle: carla.Vehicle
 
-    for response in client.apply_batch_sync(batch):
-        if response.error:
-            logging.error(response.error)
-        else:
-            actor_list.append(response.actor_id)
+    def without_vehicle(self):
+        return Box(self.points, self.distance_to_camera, self.max_distance_to_center, None)
 
-    return actor_list, spawn_points[n:]
+
+@dataclass
+class CameraLidarPair:
+    camera_image: Optional[Any] = None
+    lidar_data: Optional[Any] = None
+
+
+@dataclass
+class WorldBoxInfo:
+    # Contains info needed for bounding boxes generation.
+
+    boxes_FC: Optional[List[Box]] = None
+    boxes_FL: Optional[List[Box]] = None
+    boxes_FR: Optional[List[Box]] = None
+
+    transform: Optional[carla.Transform] = None
+    velocity: Optional[Any] = None
+    angular_velocity: Optional[Any] = None
+    acceleration: Optional[Any] = None
+
+    camera_image_FC: Optional[Any] = None
+    lidar_data_FC: Optional[Any] = None
+
+    camera_image_FL: Optional[Any] = None
+    lidar_data_FL: Optional[Any] = None
+
+    camera_image_FR: Optional[Any] = None
+    lidar_data_FR: Optional[Any] = None
+
+    is_at_traffic_light: Optional[bool] = None
+
+    def is_complete(self):
+        # checks if the info is complete to build the bounding box.
+
+        for f in fields(self):
+            if getattr(self, f.name) is None:
+                return False
+
+        return True
 
 
 class ClientSideBoundingBoxes(object):
-    """
-    This is a module responsible for creating 3D bounding boxes and drawing them
-    client-side on pygame surface.
-    """
+    @staticmethod
+    def check_bboxes_consistency_lidar(bboxes, camera, lidar_data, max_dist, min_detect):
+        filtered_data = carla_vehicle_annotator.filter_lidar(lidar_data, camera, max_dist)
+        filtered_data = np.array([p for p in filtered_data if p.object_idx != 0])
+        vehicles = [b.vehicle for b in bboxes]
+        filtered_data = carla_vehicle_annotator.get_points_id(filtered_data, vehicles, camera, max_dist)
+
+        visible_id, idx_counts = np.unique([p.object_idx for p in filtered_data], return_counts=True)
+
+        visible_vehicles = set()
+        for v, c in zip(visible_id, idx_counts):
+            if c >= min_detect:
+                visible_vehicles.add(v)
+
+        res = []
+        for b in bboxes:
+            if b.vehicle.id in visible_vehicles:
+                res.append(3)
+            else:
+                res.append(0)
+        return res
 
     @staticmethod
     def get_bounding_boxes(vehicles, camera):
@@ -169,29 +162,24 @@ class ClientSideBoundingBoxes(object):
         return bounding_boxes
 
     @staticmethod
-    def draw_bounding_boxes(bb_surface, bounding_boxes, boxes_q):
+    def draw_bounding_boxes(bb_surface, bounding_boxes):
         """
         Draws bounding boxes on pygame display.
         """
 
-        # bb_surface = pygame.Surface((VIEW_WIDTH, VIEW_HEIGHT))
         bb_surface.set_colorkey((0, 0, 0))
-        for bbox, q in zip(bounding_boxes, boxes_q):
-            points = bbox.points
+        color = (0, 255, 0)
+        for bbox in bounding_boxes:
+            points = bbox['points']
             # draw lines
             # base
-            if q:
-                color = BB_COLOR
-            else:
-                color = BB_COLOR_Q
+            print("drawing points", points)
 
             pygame.draw.line(bb_surface, color, points[0], points[1])
             pygame.draw.line(bb_surface, color, points[0], points[1])
             pygame.draw.line(bb_surface, color, points[1], points[2])
             pygame.draw.line(bb_surface, color, points[2], points[3])
             pygame.draw.line(bb_surface, color, points[3], points[0])
-
-        # display.blit(bb_surface, (0, 0))
 
     @staticmethod
     def get_bounding_box(vehicle, camera):
@@ -224,7 +212,7 @@ class ClientSideBoundingBoxes(object):
             min_y = np.min(camera_bbox[:, 1])
             points = [(max_x, max_y), (max_x, min_y), (min_x, min_y), (min_x, max_y)]
 
-            res = Box(points, distance_to_camera, max_distance_to_center)
+            res = Box(points, distance_to_camera, max_distance_to_center, vehicle)
 
             return res
 
@@ -282,10 +270,6 @@ class ClientSideBoundingBoxes(object):
 
     @staticmethod
     def get_matrix(transform):
-        """
-        Creates matrix from carla transform.
-        """
-
         rotation = transform.rotation
         location = transform.location
         c_y = np.cos(np.radians(rotation.yaw))
@@ -310,29 +294,33 @@ class ClientSideBoundingBoxes(object):
         return matrix
 
 
-# ==============================================================================
-# -- BasicSynchronousClient ----------------------------------------------------
-# ==============================================================================
-
-from collections import defaultdict, namedtuple
-
-Box = namedtuple("Box", ["points", "distance_to_camera", "max_distance_to_center"])
-
-
 class BasicSynchronousClient(object):
     """
     Basic implementation of a synchronous client.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        map_id,
+        traffic_density,
+        session_length,
+        destination_dir,
+        visualize=True,
+    ):
         self.client = None
         self.world = None
         self.camera = None
         self.car = None
-
         self.display = None
-        self.image = None
-        self.capture = True
+        self.lidar = None
+        self.depth = None
+        self.semantic = None
+
+        self.map_id = map_id
+        self.traffic_density = traffic_density
+        self.session_length = session_length
+        self.destination_dir = destination_dir
+        self.visualize = visualize
 
         self.camera_attributes = {
             "image_size_x": str(VIEW_WIDTH),
@@ -344,52 +332,92 @@ class BasicSynchronousClient(object):
 
     def blueprint(self, bp_str):
         camera_bp = self.world.get_blueprint_library().find(bp_str)
-        for k, v in CAMERA_ATTRIBUTES.items():
-            camera_bp.set_attribute(k, v)
+        # print(bp_str)
+
+        if bp_str == LIDAR_BP_STR:
+            camera_bp.set_attribute("channels", "64")
+            camera_bp.set_attribute("points_per_second", "1120000")
+            camera_bp.set_attribute("upper_fov", "45")
+            camera_bp.set_attribute("lower_fov", "-45")
+            camera_bp.set_attribute("range", "100")
+            camera_bp.set_attribute("rotation_frequency", "20")
+        else:
+            print("adding stuff")
+            for k, v in CAMERA_ATTRIBUTES.items():
+                camera_bp.set_attribute(k, v)
+
         return camera_bp
 
     def set_synchronous_mode(self, synchronous_mode):
-        """
-        Sets synchronous mode.
-        """
-
+        """Set synchronous mode."""
         settings = self.world.get_settings()
         settings.synchronous_mode = synchronous_mode
         self.world.apply_settings(settings)
 
-    def setup_car(self, spawns):
-        """
-        Spawns actor-vehicle to be controled.
-        """
-        # self.car = self.world.get_actors([car_id])[0]
+    def spawn_vehicles(self, density):
+        blueprints = self.world.get_blueprint_library().filter("vehicle.*")
+        blueprints = list(filter(lambda x: x.get_attribute("number_of_wheels").as_int() == 4, blueprints))
 
+        spawn_points = self.world.get_map().get_spawn_points()
+        number_of_spawn_points = len(spawn_points) - 1
+        number_of_vehicles = int(density * number_of_spawn_points)
+
+        if number_of_vehicles < number_of_spawn_points:
+            random.shuffle(spawn_points)
+        elif number_of_vehicles > number_of_spawn_points:
+            msg = "requested %d vehicles, but could only find %d spawn points"
+            logging.warning(msg, number_of_vehicles, number_of_spawn_points)
+            number_of_vehicles = number_of_spawn_points
+
+        SpawnActor = carla.command.SpawnActor
+        SetAutopilot = carla.command.SetAutopilot
+        FutureActor = carla.command.FutureActor
+
+        batch = []
+        actor_list = []
+        for n, transform in enumerate(spawn_points):
+            if n >= number_of_vehicles:
+                break
+            blueprint = random.choice(blueprints)
+            if blueprint.has_attribute("color"):
+                color = random.choice(blueprint.get_attribute("color").recommended_values)
+                blueprint.set_attribute("color", color)
+            blueprint.set_attribute("role_name", "autopilot")
+            batch.append(SpawnActor(blueprint, transform).then(SetAutopilot(FutureActor, True)))
+
+        for response in self.client.apply_batch_sync(batch):
+            if response.error:
+                logging.error(response.error)
+            else:
+                actor_list.append(response.actor_id)
+
+        return actor_list, spawn_points[n:]
+
+    def setup_car(self, spawns):
+        """Spawn actor-vehicle to be controled."""
         car_bp = self.world.get_blueprint_library().filter("vehicle.audi.tt")[0]
         car_bp.set_attribute("role_name", "autopilot")
         location = random.choice(spawns)
         self.car = self.world.spawn_actor(car_bp, location)
         self.car.set_autopilot(True)
 
-    def setup_sensor(self, bp_str, visualize=False):
-        """
-        Spawns actor-camera to be used to render view.
-        Sets calibration for client-side boxes rendering.
-        """
+    def setup_sensor(self, bp_str: str, location: SensorLocation):
+        """Spawn actor-camera to be used to render view.
 
+        Set calibration for client-side boxes rendering.
+        """
         # camera_transform = carla.Transform(carla.Location(x=-5.5, z=2.8), carla.Rotation(pitch=-15))
-        camera_transform = carla.Transform(carla.Location(x=0.9, z=1.4), carla.Rotation(pitch=0))
+        camera_transform = carla.Transform(
+            carla.Location(x=0.9, z=1.508, y=SENSOR_POSITIONS[location]), carla.Rotation(pitch=0)
+        )
         bp = self.blueprint(bp_str)
-        # bp.set_attribute("sensor_tick", "0.1")
         sensor = self.world.spawn_actor(bp, camera_transform, attach_to=self.car)
         weak_self = weakref.ref(self)
 
-        data_lambda = lambda data: weak_self().new_data(weak_self, bp_str, data)
+        def data_lambda(data):
+            weak_self().new_data(weak_self, bp_str, location, data)
 
-        if visualize:
-            visusalization_lambda = lambda image: weak_self().set_image(weak_self, image, COLOR_CONVERTERS[bp_str])
-            joint_lambda = lambda image: (visusalization_lambda(image), data_lambda(image))
-            sensor.listen(joint_lambda)
-        else:
-            sensor.listen(data_lambda)
+        sensor.listen(data_lambda)
 
         calibration = np.identity(3)
         calibration[0, 2] = VIEW_WIDTH / 2.0
@@ -399,11 +427,10 @@ class BasicSynchronousClient(object):
         return sensor
 
     def control(self, car):
-        """
-        Applies control to main car based on pygame pressed keys.
+        """Apply control to main car based on pygame pressed keys.
+
         Will return True If ESCAPE is hit, otherwise False to end main loop.
         """
-
         keys = pygame.key.get_pressed()
         if keys[K_ESCAPE]:
             return True
@@ -428,266 +455,342 @@ class BasicSynchronousClient(object):
         return False
 
     @staticmethod
-    def set_image(weak_self, img, cc):
-        # points = np.frombuffer(img.raw_data, dtype=np.dtype('d4')).reshape((VIEW_HEIGHT, VIEW_WIDTH))
-        """
-        Sets image coming from camera sensor.
-        The self.capture flag is a mean of synchronization - once the flag is
-        set, next coming image will be stored.
-        """
+    def new_data(weak_self, bp_str, location, data):
 
         self = weak_self()
-        if self.capture:
-            img.convert(cc)
-            self.image = img
-            self.capture = False
+        if data.frame_number % PROCESS_EVERY_N_FRAMES == 0:
+            if data.frame_number not in self.data_buffer:
+                self.data_buffer[data.frame_number] = WorldBoxInfo()
+            print("got data for ", bp_str, "on time", data.frame_number, "data", data)
 
-    @staticmethod
-    def new_data(weak_self, bp_str, data):
-        """
-        Sets image coming from camera sensor.
-        The self.capture flag is a mean of synchronization - once the flag is
-        set, next coming image will be stored.
-        """
+            if bp_str == CAMERA_BP_STR:
+                if location == SensorLocation.FC:
+                    self.data_buffer[data.frame_number].camera_image_FC = data
+                elif location == SensorLocation.FL:
+                    self.data_buffer[data.frame_number].camera_image_FL = data
+                elif location == SensorLocation.FR:
+                    self.data_buffer[data.frame_number].camera_image_FR = data
 
-        self = weak_self()
-        if data.frame_number not in self.data_buffer:
-            self.data_buffer[data.frame_number] = dict()
+            elif bp_str == LIDAR_BP_STR:
+                if location == SensorLocation.FC:
+                    self.data_buffer[data.frame_number].lidar_data_FC = data
+                elif location == SensorLocation.FL:
+                    self.data_buffer[data.frame_number].lidar_data_FL = data
+                elif location == SensorLocation.FR:
+                    self.data_buffer[data.frame_number].lidar_data_FR = data
 
-        self.data_buffer[data.frame_number][bp_str] = data
+    def render(self, display, image_array, boxes):
+        """Transform image from camera sensor and blits it to main pygame display."""
+        if self.visualize:
+            image_array = image_array[:, :, :3]  # remove alpha
+            image_array = image_array[:, :, ::-1]  # flip rgb
+            surface = pygame.surfarray.make_surface(image_array.swapaxes(0, 1))
+            ClientSideBoundingBoxes.draw_bounding_boxes(surface, boxes)
+            display.blit(surface, (0, 0))
 
-    def render(self, display, image, boxes, boxes_q):
-        """
-        Transforms image from camera sensor and blits it to main pygame display.
-        """
+    def setup_sensors(self):
+        """Set up sensors."""
+        self.camera_FC = self.setup_sensor(CAMERA_BP_STR, location=SensorLocation.FC)
+        self.camera_FL = self.setup_sensor(CAMERA_BP_STR, location=SensorLocation.FL)
+        self.camera_FR = self.setup_sensor(CAMERA_BP_STR, location=SensorLocation.FR)
 
-        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-        array = np.reshape(array, (self.image.height, self.image.width, 4))
-        array = array[:, :, :3]
-        array = array[:, :, ::-1]
-        surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-        ClientSideBoundingBoxes.draw_bounding_boxes(surface, boxes, boxes_q)
-
-        display.blit(surface, (0, 0))
+        self.lidar_FC = self.setup_sensor(LIDAR_BP_STR, location=SensorLocation.FC)
+        self.lidar_FL = self.setup_sensor(LIDAR_BP_STR, location=SensorLocation.FL)
+        self.lidar_FR = self.setup_sensor(LIDAR_BP_STR, location=SensorLocation.FR)
 
     def game_loop(self):
-        """
-        Main program loop.
-
-        """
-
+        """Run main program loop."""
         date_time = datetime.now().strftime("%m_%d_%Y_%H:%M:%S")
 
-        self.run_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k = 10)) + date_time
-        print('run id is', self.run_id)
+        self.run_id = "ver1_" + "".join(random.choices(string.ascii_uppercase + string.digits, k=10)) + date_time
+        print("run id is", self.run_id)
 
         try:
-            pygame.init()
+            if self.visualize:
+                pygame.init()
 
             self.client = carla.Client("127.0.0.1", 2000)
-            self.client.set_timeout(2.0)
-            self.world = self.client.get_world()
+            self.client.set_timeout(60.0)
 
-            actors, spawns = spawn_vehicles(self.client, self.world, 50)
+            self.world = self.client.load_world(f"Town{self.map_id:02d}_Opt")
+            self.world.unload_map_layer(carla.MapLayer.ParkedVehicles)
+
+            self.weather = carla.WeatherParameters(
+                cloudiness=random.randint(0, 100),
+                precipitation=random.randint(0, 1) * random.randint(1, 100),
+                sun_altitude_angle=random.randint(-45, 90),
+                precipitation_deposits=random.randint(0, 100),
+            )
+            self.world.set_weather(self.weather)
+            self.current_run_dir = (Path(self.destination_dir) / self.run_id)
+
+            self.current_run_dir.mkdir(parents=True, exist_ok=True)
+            with (self.current_run_dir /  "session_info.json").open("w") as f:
+                d = {
+                    "town": self.map_id,
+                    "traffic_density": self.traffic_density,
+                    "cloudiness": self.weather.cloudiness,
+                    "precipitation": self.weather.precipitation,
+                    "sun_altitude_angle": self.weather.sun_altitude_angle,
+                    "precipitation_deposits": self.weather.precipitation_deposits,
+                }
+                json.dump(d, f)
+                print(json.dumps(d))
+
+            settings = self.world.get_settings()
+            settings.fixed_delta_seconds = 0.1
+            self.world.apply_settings(settings)
+
+            self.tm = self.client.get_trafficmanager()
+            self.tm.set_synchronous_mode(True)
+
+            actors, spawns = self.spawn_vehicles(self.traffic_density)
             self.setup_car(spawns)
 
-            self.camera = self.setup_sensor(CAMERA_BP_STR)
-            self.semantic = self.setup_sensor(SEMANTIC_BP_STR)
-            self.depth = self.setup_sensor(DEPTH_BP_STR, visualize=True)
+            self.setup_sensors()
 
-            self.display = pygame.display.set_mode((VIEW_WIDTH, VIEW_HEIGHT), pygame.HWSURFACE | pygame.DOUBLEBUF)
-            pygame_clock = pygame.time.Clock()
+            if self.visualize:
+                self.display = pygame.display.set_mode((VIEW_WIDTH, VIEW_HEIGHT), pygame.HWSURFACE | pygame.DOUBLEBUF)
 
             self.set_synchronous_mode(True)
             vehicles = self.world.get_actors().filter("vehicle.*")
+            self.vehicles = vehicles
+
+            if self.weather.sun_altitude_angle < 10:
+                for v in self.vehicles:
+                    v.set_light_state(
+                        carla.VehicleLightState(carla.VehicleLightState.LowBeam | carla.VehicleLightState.Position)
+                    )
 
             def on_tick(timestamp):
                 with mutex:
-                    self.capture = True
+                    print("frame", timestamp.frame)
+                    if timestamp.frame % PROCESS_EVERY_N_FRAMES == 0:
+                        print("processing")
 
-                    bounding_boxes = ClientSideBoundingBoxes.get_bounding_boxes(vehicles, self.camera)
-                    if timestamp.frame_count not in self.data_buffer:
-                        self.data_buffer[timestamp.frame_count] = dict()
+                        if timestamp.frame_count not in self.data_buffer:
+                            self.data_buffer[timestamp.frame_count] = WorldBoxInfo()
 
-                    self.data_buffer[timestamp.frame_count]["bbox"] = bounding_boxes
+                        self.data_buffer[timestamp.frame_count].boxes_FC = ClientSideBoundingBoxes.get_bounding_boxes(
+                            vehicles, self.camera_FC
+                        )
+                        self.data_buffer[timestamp.frame_count].boxes_FL = ClientSideBoundingBoxes.get_bounding_boxes(
+                            vehicles, self.camera_FL
+                        )
+                        self.data_buffer[timestamp.frame_count].boxes_FR = ClientSideBoundingBoxes.get_bounding_boxes(
+                            vehicles, self.camera_FR
+                        )
+                        self.data_buffer[timestamp.frame_count].transform = self.car.get_transform()
+                        self.data_buffer[timestamp.frame_count].velocity = self.car.get_velocity()
+                        self.data_buffer[timestamp.frame_count].angular_velocity = self.car.get_angular_velocity()
+                        self.data_buffer[timestamp.frame_count].acceleration = self.car.get_acceleration()
+                        self.data_buffer[timestamp.frame_count].is_at_traffic_light = self.car.is_at_traffic_light()
 
-                    self.data_buffer[timestamp.frame_count]["transform"] = self.car.get_transform()
-                    self.data_buffer[timestamp.frame_count]["velocity"] = self.car.get_velocity()
-                    self.data_buffer[timestamp.frame_count]["angular_velocity"] = self.car.get_angular_velocity()
-                    self.data_buffer[timestamp.frame_count]["acceleration"] = self.car.get_acceleration()
-                    print(
-                        "acceleration",
-                        self.car.get_transform(),
-                        self.car.get_velocity(),
-                        self.car.get_acceleration(),
-                        self.car.get_angular_velocity(),
-                    )
+                        self.aggregate_buffer()
+                    else:
+                        print("skipping")
 
-                    pygame.display.flip()
+                    if self.visualize:
+                        pygame.display.flip()
 
+            callback_id = self.world.on_tick(on_tick)
+
+            t = time.time()
+            for i in range(10 * self.session_length):  # 3 minutes
+                self.world.tick(60)
+                if self.visualize:
                     pygame.event.pump()
-                    if self.control(self.car):
-                        return
+                print("current fps is ", i / (time.time() - t))
 
-                    self.aggregate_buffer()
+            return True
 
-            self.world.on_tick(on_tick)
+        except Exception as e:
+            print(e)
+            traceback.print_exc()
 
-            while True:
-                self.world.tick()
-                pygame_clock.tick_busy_loop(1)
+            return False
 
         finally:
-            self.set_synchronous_mode(False)
-            self.camera.destroy()
-            self.semantic.destroy()
-            self.depth.destroy()
-            self.car.destroy()
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in actors])
-            pygame.quit()
+            self.world.remove_on_tick(callback_id)
+            with mutex:  # acquire this to prevent ticks from happening
+                print("terminating, destroying sensors and agens")
+
+                self.camera_FC.stop()
+                self.camera_FC.destroy()
+
+                self.camera_FR.stop()
+                self.camera_FR.destroy()
+
+                self.camera_FL.stop()
+                self.camera_FL.destroy()
+
+                self.lidar_FC.stop()
+                self.lidar_FC.destroy()
+
+                self.lidar_FR.stop()
+                self.lidar_FR.destroy()
+
+                self.lidar_FL.stop()
+                self.lidar_FL.destroy()
+
+                self.car.destroy()
+                self.client.apply_batch_sync([carla.command.DestroyActor(x) for x in actors])
+
+                if self.visualize:
+                    pygame.quit()
 
     def aggregate_buffer(self):
         items = list(self.data_buffer.items())
-        cnt = 0
+        print("buffer length is", len(items))
         for k, v in items:
-            if len(v) == 8:
+            if v.is_complete():
                 self.process_data(k, v)
                 del self.data_buffer[k]
-                # import pdb; pdb.set_trace()
-            else:
-                cnt += 1
 
-    def process_data(self, key, values):
-        bboxes = values["bbox"]
+    def process_sensor_pair(self, camera, boxes, camera_image, lidar_data):
+        """Given data, builds a dict with images and boxes to be saved"""
 
-        image_raw = values[CAMERA_BP_STR]
+        image_raw = camera_image
         image = np.frombuffer(image_raw.raw_data, dtype=np.dtype("uint8"))
         image = np.reshape(image, (image_raw.height, image_raw.width, 4))
+        image_raw.convert(COLOR_CONVERTERS[CAMERA_BP_STR])
 
-        semantic_raw = values[SEMANTIC_BP_STR]
-        semantic = np.frombuffer(semantic_raw.raw_data, dtype=np.dtype("uint8")).copy()
-        semantic = np.reshape(semantic, (semantic_raw.height, semantic_raw.width, 4))[:, :, 2]
-        semantic_raw.convert(COLOR_CONVERTERS[SEMANTIC_BP_STR])
+        bboxes_q = ClientSideBoundingBoxes.check_bboxes_consistency_lidar(boxes, camera, lidar_data, 200, 5)
+        clean_boxes = []
+        for b, q in zip(boxes, bboxes_q):
+            if q:
+                res = dict(b._asdict())
+                del res["vehicle"]
+                clean_boxes.append(res)
 
-        depth_raw = values[DEPTH_BP_STR]
-        depth_raw.convert(COLOR_CONVERTERS[DEPTH_BP_STR])
-        depth = np.frombuffer(depth_raw.raw_data, dtype=np.dtype("uint8")).copy()
-        depth = np.reshape(depth, (depth_raw.height, depth_raw.width, 4))
-        depth_raw_buf = depth.copy()
-        depth = np.dot(depth[:, :, :3], [65536.0, 256.0, 1.0])
-        depth_normalized = depth / 16777215.0  # (256.0 * 256.0 * 256.0 - 1.0)
-        depth = depth_normalized * 1000.0
+        return (image, clean_boxes)
 
-        bboxes_q = [check_bbox_consistency(bbox, image, semantic, depth) for bbox in bboxes]
-
-        # import pdb
-        # pdb.set_trace()
-
-        path = Path("outputs") / self.run_id / f"{key}.pkl"
+    def process_data(self, key: str, values: WorldBoxInfo):
+        path = self.current_run_dir / f"{key}_labels.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump(
-                dict(
-                    image=image,
-                    semantic=semantic,
-                    depth=depth,
-                    depth_raw=depth_raw_buf,
-                    transform=dict(
-                        x=values["transform"].location.x,
-                        y=values["transform"].location.y,
-                        z=values["transform"].location.z,
-                        roll=values["transform"].rotation.roll,
-                        pitch=values["transform"].rotation.pitch,
-                        yaw=values["transform"].rotation.yaw,
-                    ),
-                    velocity=dict(
-                        x=values["velocity"].x,
-                        y=values["velocity"].y,
-                        z=values["velocity"].z,
-                    ),
-                    angular_velocity=dict(
-                        x=values["angular_velocity"].x,
-                        y=values["angular_velocity"].y,
-                        z=values["angular_velocity"].z,
-                    ),
-                    acceleration=dict(
-                        x=values["acceleration"].x,
-                        y=values["acceleration"].y,
-                        z=values["acceleration"].z,
-                    ),
-                    bboxes=bboxes,
-                    bboxes_q=bboxes_q,
-                ),
+
+        image_fc, boxes_fc = self.process_sensor_pair(
+            self.camera_FC, values.boxes_FC, values.camera_image_FC, values.lidar_data_FC
+        )
+        image_fl, boxes_fl = self.process_sensor_pair(
+            self.camera_FL, values.boxes_FL, values.camera_image_FL, values.lidar_data_FL
+        )
+        image_fr, boxes_fr = self.process_sensor_pair(
+            self.camera_FR, values.boxes_FR, values.camera_image_FR, values.lidar_data_FR
+        )
+
+        result = dict(
+            transform=dict(
+                x=values.transform.location.x,
+                y=values.transform.location.y,
+                z=values.transform.location.z,
+                roll=values.transform.rotation.roll,
+                pitch=values.transform.rotation.pitch,
+                yaw=values.transform.rotation.yaw,
+            ),
+            velocity=dict(
+                x=values.velocity.x,
+                y=values.velocity.y,
+                z=values.velocity.z,
+            ),
+            angular_velocity=dict(
+                x=values.angular_velocity.x,
+                y=values.angular_velocity.y,
+                z=values.angular_velocity.z,
+            ),
+            acceleration=dict(
+                x=values.acceleration.x,
+                y=values.acceleration.y,
+                z=values.acceleration.z,
+            ),
+            is_at_traffic_light=values.is_at_traffic_light,
+            boxes=dict(
+                FC=boxes_fc,
+                FR=boxes_fr,
+                FL=boxes_fl,
+            ),
+        )
+        imageio.imsave(path.with_name(f"{key}_FC.png"), image_fc)
+        imageio.imsave(path.with_name(f"{key}_FL.png"), image_fl)
+        imageio.imsave(path.with_name(f"{key}_FR.png"), image_fr)
+
+        with open(path, "w") as f:
+            json.dump(
+                result,
                 f,
             )
 
-        self.render(self.display, image_raw, bboxes, bboxes_q)
+        self.render(self.display, image_fr, boxes_fr)
 
 
-def check_bbox_consistency(bbox, image, semantic, depth):
-    # print('distance to camera', bbox.distance_to_camera)
-    if bbox.distance_to_camera > 300:
-        # print('distance')
-        return False
+def parse_args():
+    """Parse the arguments."""
+    parser = argparse.ArgumentParser(description="Generate carla data")
 
-    max_x, max_y = bbox.points[0]
-    min_x, min_y = bbox.points[2]
-    max_x = np.clip(int(max_x), 0, VIEW_WIDTH)
-    max_y = np.clip(int(max_y), 0, VIEW_HEIGHT)
-    min_x = np.clip(int(min_x), 0, VIEW_WIDTH)
-    min_y = np.clip(int(min_y), 0, VIEW_HEIGHT)
+    parser.add_argument(
+        "-d",
+        "--dest",
+        type=str,
+        help="Destination folder to put the data in.",
+        default="./output",
+    )
 
-    mask = np.zeros_like(depth)
-    mask[min_y:max_y, min_x:max_x] = 1
-    total_mask = mask.sum()
-    # print('total mask', total_mask)
-    if total_mask == 0:
-        return False
+    parser.add_argument(
+        "-m",
+        "--map",
+        type=int,
+        help="Map number to be loaded.",
+        default=4,
+    )
 
-    car_mask = semantic == 10
-    total_car = (car_mask * mask).sum()
-    # print('total_car', total_car)
-    if total_car == 0:
-        # print("no car in box")
-        return False
-    total_car_part = total_car / total_mask
+    parser.add_argument(
+        "-c",
+        "--traffic-density",
+        type=float,
+        help="Density of traffic - fraction of spawn points occupied.",
+        default=0.5,
+    )
 
-    correct_distance = np.absolute(depth - bbox.distance_to_camera) < 4 + bbox.max_distance_to_center
+    parser.add_argument(
+        "-s",
+        "--seconds",
+        type=int,
+        help="Number of seconds in each sessions.",
+        default=180,
+    )
 
-    consistent_depth = mask * correct_distance * car_mask
-    total_consistent_depth = consistent_depth.sum()
-    total_consistent_depth_part = total_consistent_depth / total_car
-    print("total consistent depth part", total_consistent_depth_part)
+    parser.add_argument(
+        "-n",
+        "--num-sessions",
+        type=int,
+        help="Number of sessions.",
+        default=100,
+    )
+    parser.add_argument(
+        "-v",
+        "--visualize",
+        action="store_true",
+        help="If set, creates a window to show the car.",
+    )
 
-    res = total_consistent_depth_part > 0.5 and total_car_part > 0.1
-    # print(total_car_part)
-    # res = total_car_part > 0.1
-
-    # TODO: figure out why the boxes don't get detected. Maybe the box is drawn incorrectly.
-
-    # if res:
-    #     import pdb; pdb.set_trace()
-
-    return res
-    # 1. at least [thresh_a=0.5] of pixels with type car should be with correct distance.
-    # 2. the pixels with correct distance should occupy at least [thresh_b=0.1] of the bbox.
-
-
-# ==============================================================================
-# -- main() --------------------------------------------------------------------
-# ==============================================================================
+    args = parser.parse_args()
+    return args
 
 
 def main():
-    """
-    Initializes the client-side bounding box demo.
-    """
-
-    try:
-        client = BasicSynchronousClient()
-        client.game_loop()
-    finally:
-        print("EXIT")
+    """Run main loop."""
+    args = parse_args()
+    print(args)
+    for _ in range(args.num_sessions):
+        client = BasicSynchronousClient(
+            map_id=args.map,
+            traffic_density=args.traffic_density,
+            session_length=args.seconds,
+            destination_dir=args.dest,
+            visualize=args.visualize,
+        )
+        if not client.game_loop():
+            break
 
 
 if __name__ == "__main__":
