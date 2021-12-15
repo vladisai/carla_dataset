@@ -1,0 +1,1 @@
+This repo contains code for recording images from carla simulations. The goal is to attach to a autopilot controlled agent in carla, and just regularly record data from sensors, along with bounding boxes.
